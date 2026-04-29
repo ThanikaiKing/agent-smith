@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project purpose
+
+This is a phased learning project for understanding Agentic AI end-to-end. Each phase is developed on its own branch and merged into `main` when complete.
+
+| Branch | Phase | Focus |
+|---|---|---|
+| `phase-1` ✅ | Foundation | ReAct loop, Gemini tool-calling, in-context memory |
+| `phase-2` | Structure | LangGraph, stateful workflows, external memory |
+| `phase-3` | Multi-Agent | CrewAI, Planner + Executor agents, human-in-the-loop |
+| `phase-4` | Real Project | Personal productivity agent via MCP (TickTick, Gmail, Calendar) |
+
+When starting a new phase, branch from `main` as `phase-N`. When done, merge back to `main`.
+
 ## Commands
 
 ```bash
