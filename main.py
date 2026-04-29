@@ -1,11 +1,56 @@
 import json
+import logging
 import math
 import time
 from google import genai
 from google.genai import types
 from google.genai import errors
 
+# ─────────────────────────────────────────────
+# LOGGING SETUP
+#
+# Two handlers:
+#   • Console — INFO and above (key events only)
+#   • agent.log — DEBUG and above (everything, for review)
+#
+# Levels used in this file:
+#   DEBUG   → token counts, full tool results, response metadata
+#   INFO    → each API call start/finish, tool invocations
+#   WARNING → retries (rate limit, server errors)
+#   ERROR   → terminal failures that stop execution
+# ─────────────────────────────────────────────
+
+log = logging.getLogger("agent")
+log.setLevel(logging.DEBUG)
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)-8s] %(message)s", datefmt="%H:%M:%S")
+
+_console = logging.StreamHandler()
+_console.setLevel(logging.INFO)
+_console.setFormatter(_fmt)
+
+_file = logging.FileHandler("agent.log")
+_file.setLevel(logging.DEBUG)
+_file.setFormatter(_fmt)
+
+log.addHandler(_console)
+log.addHandler(_file)
+
 client = genai.Client()
+
+def _to_loggable(obj):
+    """Recursively convert SDK objects to plain dicts/lists so they can be JSON-serialised."""
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    if isinstance(obj, list):
+        return [_to_loggable(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: _to_loggable(v) for k, v in obj.items()}
+    if hasattr(obj, "model_dump"):          # pydantic models (most SDK types)
+        return _to_loggable(obj.model_dump())
+    if hasattr(obj, "__dict__"):            # plain objects
+        return _to_loggable({k: v for k, v in obj.__dict__.items() if not k.startswith("_")})
+    return str(obj)
 
 # ─────────────────────────────────────────────
 # TOOLS — These are the agent's "hands"
@@ -100,28 +145,90 @@ def run_agent(user_message: str):
     print(f"\n{'='*50}")
     print(f"USER: {user_message}")
     print(f"{'='*50}")
+    log.info("Agent started | prompt=%r", user_message[:80])
 
     contents = [
         types.Content(role="user", parts=[types.Part(text=user_message)])
     ]
 
+    turn = 0
+
     # The loop — keeps going until Gemini stops making function calls
     while True:
+        turn += 1
+        response = None
         for attempt in range(1, 4):
+            log.info(
+                "API call | model=gemini-3.1-flash-lite-preview  turn=%d  attempt=%d  context_messages=%d",
+                turn, attempt, len(contents),
+            )
+            log.debug(
+                "REQUEST BODY:\n%s",
+                json.dumps({"contents": _to_loggable(contents), "config": _to_loggable(config)}, indent=2),
+            )
+            t0 = time.perf_counter()
             try:
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.1-flash-lite-preview",
                     contents=contents,
                     config=config,
                 )
+                elapsed = time.perf_counter() - t0
+                u = response.usage_metadata
+                log.info(
+                    "API response | latency=%.2fs  tokens(prompt=%s out=%s total=%s)  finish=%s",
+                    elapsed,
+                    u.prompt_token_count,
+                    u.candidates_token_count,
+                    u.total_token_count,
+                    response.candidates[0].finish_reason,
+                )
+                log.debug(
+                    "RESPONSE BODY:\n%s",
+                    json.dumps(_to_loggable(response.candidates), indent=2),
+                )
                 break
+            except errors.ClientError as e:
+                if e.code == 429:
+                    # Extract suggested retry delay from the API response details
+                    retry_delay = None
+                    try:
+                        for detail in e.details.get("error", {}).get("details", []):
+                            if "retryDelay" in detail:
+                                retry_delay = int(detail["retryDelay"].rstrip("s"))
+                                break
+                    except (AttributeError, ValueError):
+                        pass
+                    wait = retry_delay if retry_delay else 2 ** (attempt + 4)
+                    if attempt < 3:
+                        log.warning("Rate limit (429) — retrying in %ds (attempt %d/3)", wait, attempt)
+                        print(f"   [429 rate limit — retrying in {wait}s…]")
+                        time.sleep(wait)
+                    else:
+                        log.error("Rate limit (429) — all retries exhausted, suggested wait=%ds", wait)
+                        print(f"\nRate limit exceeded. Please wait {wait}s before retrying.")
+                        return
+                else:
+                    # 4xx errors are caller mistakes — no point retrying
+                    log.error("Client error (%d %s): %s", e.code, e.status, e.message)
+                    print(f"\nAPI error ({e.code} {e.status}): {e.message}")
+                    return
             except errors.ServerError as e:
-                if e.status_code == 503 and attempt < 3:
+                if attempt < 3:
                     wait = 2 ** attempt
-                    print(f"   [503 unavailable, retrying in {wait}s…]")
+                    log.warning("Server error (%d) — retrying in %ds (attempt %d/3)", e.code, wait, attempt)
+                    print(f"   [{e.code} server error — retrying in {wait}s…]")
                     time.sleep(wait)
                 else:
-                    raise
+                    log.error("Server error (%d %s) — all retries exhausted: %s", e.code, e.status, e.message)
+                    print(f"\nServer error ({e.code} {e.status}): {e.message}")
+                    return
+            except Exception as e:
+                log.error("Unexpected error: %s", e, exc_info=True)
+                print(f"\nUnexpected error: {e}")
+                return
+        if response is None:
+            return
 
         parts = response.candidates[0].content.parts
         function_calls = [p for p in parts if p.function_call and p.function_call.name]
@@ -134,10 +241,13 @@ def run_agent(user_message: str):
             tool_response_parts = []
             for part in function_calls:
                 fc = part.function_call
+                args = dict(fc.args)
+                log.info("Tool call | name=%s  args=%s", fc.name, json.dumps(args))
                 print(f"\n🔧 AGENT CALLS TOOL: {fc.name}")
-                print(f"   Input: {json.dumps(dict(fc.args), indent=2)}")
+                print(f"   Input: {json.dumps(args, indent=2)}")
 
-                result = execute_tool(fc.name, dict(fc.args))
+                result = execute_tool(fc.name, args)
+                log.debug("Tool result | name=%s  result=%r", fc.name, result)
                 print(f"   Result: {result}")
 
                 tool_response_parts.append(
@@ -152,6 +262,7 @@ def run_agent(user_message: str):
         # ── Gemini is done — no more tool calls ──
         else:
             final_text = "".join(p.text for p in parts if p.text)
+            log.info("Agent finished | turns=%d  response_chars=%d", turn, len(final_text))
             print(f"\n🤖 AGENT: {final_text}")
             break
 
